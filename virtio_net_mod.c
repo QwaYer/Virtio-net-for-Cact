@@ -29,7 +29,26 @@ extern void     net_register_driver(net_driver_t* drv);
 extern void     net_unregister_driver(net_driver_t* drv);
 extern void     net_receive(skb_t* skb);
 extern void*    memset(void* s, int c, size_t n);
-extern void     irq_register_handler(unsigned int irq, void (*handler)(void));
+
+/* MSI-X table entry struct (must match kernel's msi.h) */
+struct msix_table_entry {
+    uint32_t msg_addr_lo;
+    uint32_t msg_addr_hi;
+    uint32_t msg_data;
+    uint32_t vector_ctrl;
+} __attribute__((packed));
+
+extern int      msix_alloc_vector(void);
+extern void     msix_free_vector(int vec);
+extern int      msix_register_handler(int vec, void (*handler)(void));
+extern void     msix_unregister_handler(int vec);
+extern int      pci_msix_support(pci_device_t *dev);
+extern int      pci_msix_table_map(pci_device_t *dev,
+                                   volatile struct msix_table_entry **table_out,
+                                   uint32_t *table_size_out);
+extern int      pci_msix_enable(pci_device_t *dev, int vec,
+                                volatile struct msix_table_entry *table,
+                                unsigned int entry_idx);
 extern void     net_driver_irq_wake(void);
 /* log_level_t: LOG_OK=0 LOG_WARN=1 LOG_ERROR=2 LOG_FAIL=3 (kernel.h) */
 extern void     klog(int level, const char* message);
@@ -51,8 +70,8 @@ static uint16_t io_base;
 static uint8_t  vnet_bus, vnet_dev, vnet_fn;
 static uint32_t vnet_saved_pci_cmd_dw;
 static int      virtio_net_ready;
-static uint8_t  vnet_irq_line;
 static int      vnet_irq_armed;
+static int      vnet_msix_vector;
 
 typedef struct {
     virtq_desc_t*  desc;
@@ -115,23 +134,7 @@ static void virtq_deactivate(uint16_t queue_idx) {
     port_long_out(io_base + VIRTIO_PCI_QUEUE_PFN, 0);
 }
 
-static void pic_mask_line(unsigned irq) {
-    if (irq >= 16) return;
-    uint16_t port = irq < 8 ? 0x21u : 0xA1u;
-    uint8_t  line = irq < 8 ? (uint8_t)irq : (uint8_t)(irq - 8);
-    uint8_t  m    = port_byte_in(port);
-    m |= (uint8_t)(1u << line);
-    port_byte_out(port, m);
-}
 
-static void pic_unmask_line(unsigned irq) {
-    if (irq >= 16) return;
-    uint16_t port = irq < 8 ? 0x21u : 0xA1u;
-    uint8_t  line = irq < 8 ? (uint8_t)irq : (uint8_t)(irq - 8);
-    uint8_t  m    = port_byte_in(port);
-    m &= (uint8_t)~(1u << line);
-    port_byte_out(port, m);
-}
 
 static void virtio_net_free_rx_skbs(void) {
     for (int i = 0; i < VIRTQ_MAX_SIZE; i++) {
@@ -270,10 +273,11 @@ static void virtio_detach(void) {
     int had_any = virtio_net_ready || io_base != 0 || vq_rx.desc != NULL ||
                   vq_tx.desc != NULL || vnet_irq_armed;
 
-    if (vnet_irq_armed && vnet_irq_line < 16) {
-        irq_register_handler(vnet_irq_line, NULL);
-        pic_mask_line(vnet_irq_line);
-        vnet_irq_armed = 0;
+    if (vnet_msix_vector >= 0) {
+        msix_unregister_handler(vnet_msix_vector);
+        msix_free_vector(vnet_msix_vector);
+        vnet_msix_vector = -1;
+        vnet_irq_armed   = 0;
     }
 
     if (virtio_net_ready) {
@@ -363,14 +367,24 @@ int pci_driver_probe(pci_device_t* dev) {
     net_register_driver(&virtio_driver);
     rx_fill();
 
-    vnet_irq_line = dev->irq_line;
-    if (vnet_irq_line < 16) {
-        irq_register_handler(vnet_irq_line, virtio_net_irq_handler);
-        pic_unmask_line(vnet_irq_line);
-        vnet_irq_armed = 1;
-    } else {
+    vnet_msix_vector = -1;
+    {
+        volatile struct msix_table_entry *table = NULL;
+        uint32_t table_size = 0;
+        int cap = pci_msix_support(dev);
+        if (cap && pci_msix_table_map(dev, &table, &table_size) == 0 && table_size > 0) {
+            int vec = msix_alloc_vector();
+            if (vec > 0) {
+                msix_register_handler(vec, virtio_net_irq_handler);
+                pci_msix_enable(dev, vec, table, 0);
+                vnet_msix_vector = vec;
+                vnet_irq_armed   = 1;
+            }
+        }
+    }
+    if (vnet_msix_vector < 0) {
+        klog(KLOG_WARN, "virtio-net (kmod): MSI-X unavailable — poll-only");
         vnet_irq_armed = 0;
-        klog(KLOG_WARN, "virtio-net (kmod): no valid PCI IRQ line — RX via poll only");
     }
 
     virtio_net_ready = 1;
@@ -381,8 +395,6 @@ int pci_driver_probe(pci_device_t* dev) {
         if (i) kprint((char*)":");
         kprint_hex(virtio_driver.mac.b[i]);
     }
-    kprint((char*)"\n    PCI IRQ line ");
-    kprint_hex(vnet_irq_line);
     kprint((char*)"\n");
 
     klog(KLOG_OK, "virtio-net (kmod): driver attached — network stack ready");

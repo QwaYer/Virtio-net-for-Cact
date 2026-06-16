@@ -13,7 +13,7 @@ endif
 INSTALL_DIR := $(LOCAL_REPO)/lib
 
 MOD_CFLAGS := -m32 -ffreestanding -fno-pie -fno-stack-protector -nostdlib \
-	-I$(KERN_ROOT)/Cact/kernel/net \
+	-I$(KERN_ROOT)/Cact/net \
 	-I$(KERN_ROOT)/Cact/kernel/sync \
 	-I$(KERN_ROOT)/Cact/drivers/pci/enum \
 	-I$(KERN_ROOT)/Cact/drivers/pci \
